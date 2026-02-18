@@ -1,0 +1,25 @@
+# Core dependencies
+numpy>=1.21.0
+pandas>=1.3.0
+scikit-learn>=1.0.0
+
+# Visualization
+matplotlib>=3.4.0
+seaborn>=0.11.0
+missingno>=0.5.0
+
+# Data processing
+scipy>=1.7.0
+joblib>=1.0.0
+tqdm>=4.62.0
+
+# Data formats
+pyarrow>=6.0.0  # For parquet support
+openpyxl>=3.0.0  # For Excel support
+
+# Data download
+gdown>=4.6.0  # For downloading from Google Drive
+
+# Jupyter
+jupyter>=1.0.0
+notebook>=6.4.0

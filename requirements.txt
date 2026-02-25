@@ -1,5 +1,6 @@
 # Core dependencies
-numpy>=1.21.0
+# Keep NumPy <2 for compatibility with the current PyTorch stack in this project.
+numpy>=1.21.0,<2
 pandas>=1.3.0
 scikit-learn>=1.0.0
 

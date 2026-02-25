@@ -4,39 +4,57 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import accuracy_score, precision_score, r2_score, recall_score
 import torch
 import torch.nn as nn
+from typing import Optional, Sequence, Union
 
 from src.config import ANNUALIZATION_FACTOR, DEFAULT_TRAIN_WINDOW
 
 
 class BacktestNN(nn.Module):
+    @staticmethod
+    def _activation_layer(act: str) -> nn.Module:
+        act = act.lower()
+        if act == "relu":
+            return nn.ReLU()
+        if act == "tanh":
+            return nn.Tanh()
+        if act == "gelu":
+            return nn.GELU()
+        raise ValueError(f"Unsupported activation function: {act}")
+
     def __init__(
         self,
         d_in: int,
-        hidden_dims: int = 64,
-        act: str = "relu",
+        hidden_dims: Union[int, Sequence[int]] = (64, 32),
+        n_hidden_layers: int = 2,
+        act: str = "tanh",
         dropout: float = 0.5,
         T: int = DEFAULT_TRAIN_WINDOW,
         epochs: int = 100,
         batch_size: int = 32,
-        lr: float = 1e-3,
+        lr: float = 1e-3, 
     ):
         super().__init__()
-        act = act.lower()
-        if act == "relu":
-            activation = nn.ReLU()
-        elif act == "tanh":
-            activation = nn.Tanh()
-        elif act == "gelu":
-            activation = nn.GELU()
+        if isinstance(hidden_dims, int):
+            if n_hidden_layers < 1:
+                raise ValueError("n_hidden_layers must be >= 1")
+            hidden_layer_dims = [hidden_dims] * n_hidden_layers
         else:
-            raise ValueError(f"Unsupported activation function: {act}")
+            hidden_layer_dims = [int(h) for h in hidden_dims]
+            if not hidden_layer_dims:
+                raise ValueError("hidden_dims sequence must contain at least one layer size")
+            if any(h < 1 for h in hidden_layer_dims):
+                raise ValueError("all hidden layer sizes must be >= 1")
 
-        self.net = nn.Sequential(
-            nn.Linear(d_in, hidden_dims),
-            activation,
-            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
-            nn.Linear(hidden_dims, 1),
-        )
+        layers = []
+        in_dim = d_in
+        for out_dim in hidden_layer_dims:
+            layers.append(nn.Linear(in_dim, out_dim))
+            layers.append(self._activation_layer(act))
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            in_dim = out_dim
+        layers.append(nn.Linear(in_dim, 1))
+        self.net = nn.Sequential(*layers)
 
         self.epochs = epochs
         self.batch_size = batch_size
@@ -61,11 +79,11 @@ class BacktestNN(nn.Module):
 
     def fit(
         self,
-        X: pd.DataFrame | np.ndarray,
-        y: pd.Series | np.ndarray,
-        epochs: int | None = None,
-        batch_size: int | None = None,
-        lr: float | None = None,
+        X: Union[pd.DataFrame, np.ndarray],
+        y: Union[pd.Series, np.ndarray],
+        epochs: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        lr: Optional[float] = None,
     ):
         epochs = self.epochs if epochs is None else epochs
         batch_size = self.batch_size if batch_size is None else batch_size
@@ -97,9 +115,9 @@ class BacktestNN(nn.Module):
 
     def predict(
         self,
-        X: pd.DataFrame | np.ndarray,
-        y: pd.Series | np.ndarray | None = None,
-    ) -> "BacktestNN" | np.ndarray:
+        X: Union[pd.DataFrame, np.ndarray],
+        y: Optional[Union[pd.Series, np.ndarray]] = None,
+    ) -> Union["BacktestNN", np.ndarray]:
         # Inference mode: keep compatibility with your existing `predict(X)` usage.
         if y is None:
             X_values = X.values if isinstance(X, pd.DataFrame) else X
@@ -108,7 +126,10 @@ class BacktestNN(nn.Module):
             X_tensor = torch.tensor(X_values, dtype=torch.float32).to(device)
             self.eval()
             with torch.no_grad():
-                predictions = self(X_tensor).cpu().numpy().flatten()
+                # Avoid Torch's NumPy bridge, which may be unavailable in some environments.
+                predictions = np.asarray(
+                    self(X_tensor).detach().cpu().view(-1).tolist(), dtype=float
+                )
             return predictions
 
         # Backtest mode: mirror backtest.py's `predict(features, returns)` behavior.
@@ -239,10 +260,10 @@ class BacktestNN(nn.Module):
 
     def backtest(
         self,
-        X: pd.DataFrame | np.ndarray,
-        y: pd.Series | np.ndarray,
-        X_test: pd.DataFrame | np.ndarray,
-        y_test: pd.Series | np.ndarray,
+        X: Union[pd.DataFrame, np.ndarray],
+        y: Union[pd.Series, np.ndarray],
+        X_test: Union[pd.DataFrame, np.ndarray],
+        y_test: Union[pd.Series, np.ndarray],
     ) -> float:
         self.fit(X, y)
         predictions = self.predict(X_test)
@@ -252,6 +273,8 @@ class BacktestNN(nn.Module):
         self.performance = cumulative_return
         return float(cumulative_return)
 
-    def evaluate(self, X: pd.DataFrame | np.ndarray, y: pd.Series | np.ndarray):
+    def evaluate(
+        self, X: Union[pd.DataFrame, np.ndarray], y: Union[pd.Series, np.ndarray]
+    ):
         self.predict(X, y)
         return self.calc_performance()

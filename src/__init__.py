@@ -11,6 +11,7 @@ Modules:
 """
 
 from src.backtest import Backtest
+from src.backtest_nn import BacktestNN
 from src.config import (
     DATA_DIR,
     DOCS_DIR,
@@ -32,6 +33,7 @@ __all__ = [
     "ensure_dirs_exist",
     "load_data",
     "load_nber",
+    "BacktestNN",
 ]
 
 __version__ = "0.1.0"

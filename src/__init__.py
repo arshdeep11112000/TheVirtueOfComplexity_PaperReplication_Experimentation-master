@@ -20,6 +20,7 @@ from src.config import (
     ensure_dirs_exist,
 )
 from src.dataset import load_data, load_nber
+from src.openap_subset import dl_openap_subset
 from src.rff import RandomFourierFeatures, RFF
 
 __all__ = [
@@ -33,6 +34,7 @@ __all__ = [
     "ensure_dirs_exist",
     "load_data",
     "load_nber",
+    "dl_openap_subset",
     "BacktestNN",
 ]
 

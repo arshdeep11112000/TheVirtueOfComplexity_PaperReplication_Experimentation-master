@@ -63,6 +63,23 @@ metrics = load_metrics()
 
 To regenerate it yourself (takes multiple hours), delete the file and re-run the notebook.
 
+### OpenAP subset (10 factors, 20 stocks, 10 years)
+
+If you want a compact panel from `openassetpricing` instead of downloading/keeping all signals:
+
+```bash
+pip install openassetpricing
+python3 -m src.openap_subset --n-factors 10 --n-stocks 20 --n-years 10 --output data/openap_subset_10f_20s_10y.parquet
+```
+
+You can also call it from Python:
+
+```python
+from src import dl_openap_subset
+
+subset, factors, stocks = dl_openap_subset(n_factors=10, n_stocks=20, n_years=10)
+```
+
 ## Results
 
 ### Market Timing vs Recessions

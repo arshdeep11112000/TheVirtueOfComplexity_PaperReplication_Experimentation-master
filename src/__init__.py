@@ -20,6 +20,7 @@ from src.config import (
     ensure_dirs_exist,
 )
 from src.dataset import load_data, load_nber
+from src.ipca_workflow import IPCAMatrices, IPCAWorkflow
 from src.openap_subset import dl_openap_subset
 from src.rff import RandomFourierFeatures, RFF
 
@@ -36,6 +37,8 @@ __all__ = [
     "load_nber",
     "dl_openap_subset",
     "BacktestNN",
+    "IPCAWorkflow",
+    "IPCAMatrices",
 ]
 
 __version__ = "0.1.0"

@@ -299,6 +299,112 @@ class IPCAWorkflow:
 
         return out
 
+    def drop_low_std_and_high_corr(
+        self,
+        df: pd.DataFrame,
+        char_cols: Optional[List[str]] = None,
+        min_std: float = 1e-6,
+        max_corr: float = 0.98,
+        protected_cols: Optional[List[str]] = None,
+    ) -> Tuple[pd.DataFrame, List[str], List[str]]:
+        """Drop characteristics with very low std and very high pairwise correlation.
+
+        Steps:
+        1) Remove characteristics with std <= min_std (or NaN std).
+        2) On remaining characteristics, greedily remove one variable from each
+           pair whose absolute correlation exceeds max_corr.
+
+        Returns
+        -------
+        filtered_df : pd.DataFrame
+            Input DataFrame with selected characteristics kept.
+        kept_char_cols : list[str]
+            Final characteristic columns retained.
+        dropped_char_cols : list[str]
+            Characteristics removed by low-std and high-corr filtering.
+        """
+        if min_std < 0:
+            raise ValueError("min_std must be non-negative.")
+        if not 0.0 <= max_corr <= 1.0:
+            raise ValueError("max_corr must be between 0 and 1.")
+
+        out = df.copy()
+        if protected_cols is None:
+            protected_cols = [
+                self.id_col,
+                self.time_col,
+                "ret",
+                "excess_ret",
+                "year",
+                "y_ipca",
+                "i_idx",
+                "t_idx",
+            ]
+
+        if char_cols is None:
+            candidate_cols = [
+                c
+                for c in out.columns
+                if c not in protected_cols and pd.api.types.is_numeric_dtype(out[c])
+            ]
+        else:
+            candidate_cols = [
+                c
+                for c in char_cols
+                if c in out.columns and pd.api.types.is_numeric_dtype(out[c])
+            ]
+
+        if not candidate_cols:
+            return out, [], []
+
+        std = out[candidate_cols].std(axis=0, ddof=0)
+        low_std_cols = std[(std <= min_std) | (~np.isfinite(std))].index.tolist()
+        remaining = [c for c in candidate_cols if c not in low_std_cols]
+
+        dropped_high_corr: List[str] = []
+        if remaining:
+            corr = out[remaining].corr().abs()
+            mean_corr = corr.mean(axis=0).fillna(0.0)
+            nan_frac = out[remaining].isna().mean(axis=0)
+
+            # Greedy pruning: remove one variable from the most-correlated pair first.
+            work_cols = remaining.copy()
+            while True:
+                if len(work_cols) < 2:
+                    break
+                corr_sub = corr.loc[work_cols, work_cols]
+                upper = corr_sub.where(np.triu(np.ones(corr_sub.shape), k=1).astype(bool))
+                stacked = upper.stack()
+                if stacked.empty:
+                    break
+                most_corr = stacked.max()
+                if not np.isfinite(most_corr) or most_corr <= max_corr:
+                    break
+
+                c1, c2 = stacked.idxmax()
+                # Prefer dropping the noisier or more redundant feature.
+                if nan_frac[c1] > nan_frac[c2]:
+                    drop_col = c1
+                elif nan_frac[c2] > nan_frac[c1]:
+                    drop_col = c2
+                elif mean_corr[c1] > mean_corr[c2]:
+                    drop_col = c1
+                elif mean_corr[c2] > mean_corr[c1]:
+                    drop_col = c2
+                else:
+                    drop_col = max(c1, c2)
+
+                dropped_high_corr.append(drop_col)
+                work_cols.remove(drop_col)
+
+            remaining = work_cols
+
+        dropped_char_cols = low_std_cols + dropped_high_corr
+        keep_set = set(remaining)
+        non_char_cols = [c for c in out.columns if c not in candidate_cols]
+        final_cols = non_char_cols + [c for c in candidate_cols if c in keep_set]
+        return out[final_cols].copy(), remaining, dropped_char_cols
+
     def build_model_panel(
         self,
         df: pd.DataFrame,
@@ -437,3 +543,204 @@ class IPCAWorkflow:
                 mean_factor=mean_factor,
             )
         )
+
+    @staticmethod
+    def _predict_ipca_panel(
+        model: InstrumentedPCA,
+        X: np.ndarray,
+        indices: np.ndarray,
+        mean_factor: bool = True,
+    ) -> np.ndarray:
+        """Predict panel returns with compatibility across ipca package signatures."""
+        attempts = [
+            lambda: model.predict(
+                X, indices=indices, data_type="panel", mean_factor=mean_factor
+            ),
+            lambda: model.predict(X, indices=indices, data_type="panel"),
+            lambda: model.predict(X, indices, data_type="panel", mean_factor=mean_factor),
+            lambda: model.predict(X, indices, data_type="panel"),
+            lambda: model.predict(X, indices=indices, mean_factor=mean_factor),
+            lambda: model.predict(X, indices=indices),
+            lambda: model.predict(X, indices),
+            lambda: model.predict(X),
+        ]
+        last_exc: Optional[Exception] = None
+        for fn in attempts:
+            try:
+                pred = fn()
+                arr = np.asarray(pred, dtype=np.float64).reshape(-1)
+                if arr.shape[0] != X.shape[0]:
+                    raise ValueError(
+                        f"Unexpected prediction length {arr.shape[0]} for X with {X.shape[0]} rows."
+                    )
+                return arr
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                continue
+        raise RuntimeError(
+            "Failed to call InstrumentedPCA.predict with known signatures."
+        ) from last_exc
+
+    def rolling_ipca_predictions(
+        self,
+        char_data: pd.DataFrame,
+        forecast_start: str | pd.Timestamp = "2016-01-01",
+        char_cols: Optional[List[str]] = None,
+        target_col: str = "y_ipca",
+        n_factors: int = 3,
+        intercept: bool = False,
+        max_iter: int = 5000,
+        iter_tol: float = 1e-4,
+        silent: bool = True,
+        normalize: bool = True,
+        train_window_months: Optional[int] = None,
+        min_train_obs: int = 5000,
+        mean_factor: bool = True,
+    ) -> pd.DataFrame:
+        """Run rolling IPCA from ``forecast_start`` and return prediction DataFrame.
+
+        The method refits IPCA each month using only prior data, then predicts for
+        that month and stores ``y_pred`` and ``y_true``.
+        """
+        work = char_data.copy()
+        work[self.time_col] = pd.to_datetime(work[self.time_col], errors="coerce").dt.to_period(
+            "M"
+        ).dt.to_timestamp()
+        work = work.dropna(subset=[self.id_col, self.time_col]).copy()
+
+        if target_col not in work.columns:
+            if self.ret_col in work.columns:
+                work = work.sort_values([self.id_col, self.time_col]).copy()
+                work[target_col] = work.groupby(self.id_col)[self.ret_col].shift(-1)
+            else:
+                raise ValueError(
+                    f"'{target_col}' not found and '{self.ret_col}' unavailable to build it."
+                )
+
+        if char_cols is None:
+            exclude = {
+                self.id_col,
+                self.time_col,
+                self.ret_col,
+                "ret",
+                "excess_ret",
+                "year",
+                target_col,
+                "i_idx",
+                "t_idx",
+            }
+            char_cols = [
+                c
+                for c in work.columns
+                if c not in exclude and pd.api.types.is_numeric_dtype(work[c])
+            ]
+        if not char_cols:
+            raise ValueError("No characteristic columns available for IPCA.")
+
+        work = work.sort_values([self.time_col, self.id_col]).reset_index(drop=True)
+        work["i_idx_global"] = work[self.id_col].factorize(sort=True)[0].astype(np.int64)
+        work["t_idx_global"] = work[self.time_col].factorize(sort=True)[0].astype(np.int64)
+
+        months = np.sort(work[self.time_col].dropna().unique())
+        start_ts = pd.Timestamp(forecast_start).to_period("M").to_timestamp()
+        pred_months = [m for m in months if m >= start_ts]
+        if not pred_months:
+            return pd.DataFrame(
+                columns=[
+                    self.id_col,
+                    self.time_col,
+                    "y_true",
+                    "y_pred",
+                    "train_end",
+                    "n_train",
+                    "n_test",
+                ]
+            )
+
+        results: List[pd.DataFrame] = []
+        for test_month in pred_months:
+            train = work[work[self.time_col] < test_month].copy()
+            if train_window_months is not None:
+                cutoff = pd.Timestamp(test_month) - pd.DateOffset(months=train_window_months)
+                train = train[train[self.time_col] >= cutoff].copy()
+
+            test = work[work[self.time_col] == test_month].copy()
+            if train.empty or test.empty:
+                continue
+
+            X_train_raw = train[char_cols].to_numpy(np.float64)
+            y_train_raw = train[target_col].to_numpy(np.float64)
+            idx_train = train[["i_idx_global", "t_idx_global"]].to_numpy(np.int64)
+
+            finite_train = np.isfinite(X_train_raw).all(axis=1) & np.isfinite(y_train_raw)
+            if finite_train.sum() < min_train_obs:
+                continue
+
+            X_train = X_train_raw[finite_train]
+            y_train = y_train_raw[finite_train]
+            idx_train = idx_train[finite_train]
+
+            X_test_raw = test[char_cols].to_numpy(np.float64)
+            idx_test = test[["i_idx_global", "t_idx_global"]].to_numpy(np.int64)
+            y_true = test[target_col].to_numpy(np.float64)
+            finite_test = np.isfinite(X_test_raw).all(axis=1)
+
+            if normalize:
+                mu = X_train.mean(axis=0)
+                sd = X_train.std(axis=0, ddof=0)
+                sd = np.where(np.isfinite(sd) & (sd > 0), sd, 1.0)
+                X_train = (X_train - mu) / sd
+                X_test = (X_test_raw - mu) / sd
+            else:
+                X_test = X_test_raw
+
+            model = self.fit_ipca(
+                X=X_train,
+                y=y_train,
+                indices=idx_train,
+                n_factors=n_factors,
+                intercept=intercept,
+                max_iter=max_iter,
+                iter_tol=iter_tol,
+                silent=silent,
+            )
+
+            y_pred = np.full(shape=(len(test),), fill_value=np.nan, dtype=np.float64)
+            if finite_test.any():
+                y_pred_finite = self._predict_ipca_panel(
+                    model=model,
+                    X=X_test[finite_test],
+                    indices=idx_test[finite_test],
+                    mean_factor=mean_factor,
+                )
+                y_pred[finite_test] = y_pred_finite
+
+            res = pd.DataFrame(
+                {
+                    self.id_col: test[self.id_col].to_numpy(),
+                    self.time_col: test[self.time_col].to_numpy(),
+                    "y_true": y_true,
+                    "y_pred": y_pred,
+                    "train_end": pd.Timestamp(test_month) - pd.offsets.MonthBegin(1),
+                    "n_train": int(X_train.shape[0]),
+                    "n_test": int(len(test)),
+                }
+            )
+            results.append(res)
+
+        if not results:
+            return pd.DataFrame(
+                columns=[
+                    self.id_col,
+                    self.time_col,
+                    "y_true",
+                    "y_pred",
+                    "train_end",
+                    "n_train",
+                    "n_test",
+                ]
+            )
+
+        return pd.concat(results, axis=0, ignore_index=True).sort_values(
+            [self.time_col, self.id_col]
+        ).reset_index(drop=True)

@@ -22,6 +22,13 @@ from src.config import (
 from src.dataset import load_data, load_nber
 from src.ipca_workflow import IPCAMatrices, IPCAWorkflow
 from src.openap_subset import dl_openap_subset
+from src.portfolio_utils import (
+    build_long_only_portfolio,
+    build_quantile_portfolios,
+    compute_portfolio_returns,
+    plot_cumulative,
+    portfolio_performance,
+)
 from src.rff import RandomFourierFeatures, RFF
 
 __all__ = [
@@ -39,6 +46,11 @@ __all__ = [
     "BacktestNN",
     "IPCAWorkflow",
     "IPCAMatrices",
+    "build_quantile_portfolios",
+    "build_long_only_portfolio",
+    "compute_portfolio_returns",
+    "portfolio_performance",
+    "plot_cumulative",
 ]
 
 __version__ = "0.1.0"

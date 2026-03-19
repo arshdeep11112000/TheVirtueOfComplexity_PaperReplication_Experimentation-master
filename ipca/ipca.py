@@ -1581,7 +1581,7 @@ def _Gamma_fit_panel(F_New, X, y, indices, PSF, L, Ktilde, alpha, l1_ratio,
 
     ridgeless_rcond = kwargs.pop("ridgeless_rcond", None)
     ridgeless_alpha_tol = kwargs.pop("ridgeless_alpha_tol", 1e-8)
-    ridge_solver = kwargs.pop("ridge_solver", "svd")
+    ridge_solver = kwargs.pop("ridge_solver", "auto")
 
     # Coordinate descent only when an L1 component is explicitly requested.
     if alpha > ridgeless_alpha_tol and l1_ratio > 0:
@@ -1614,7 +1614,7 @@ def _Gamma_fit_panel(F_New, X, y, indices, PSF, L, Ktilde, alpha, l1_ratio,
     return gamma
 
 
-def _ridge_fit(X, y, alpha, solver="svd"):
+def _ridge_fit(X, y, alpha, solver="auto"):
     """Return ridge regression coefficients without an intercept."""
     X = np.ascontiguousarray(X, dtype=np.float64)
     y = np.ascontiguousarray(y, dtype=np.float64).reshape(-1)

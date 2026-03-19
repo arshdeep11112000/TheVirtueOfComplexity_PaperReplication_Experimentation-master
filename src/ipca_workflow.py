@@ -60,7 +60,9 @@ class IPCAWorkflow:
         intercept: bool = False,
         max_iter: int = 5000,
         iter_tol: float = 1e-4,
+        alpha: float = 1.0,
         silent: bool = True,
+        ridge_solver: str = "auto",
         warm_Gamma: Optional[np.ndarray] = None,
         warm_Factors: Optional[np.ndarray] = None,
     ) -> InstrumentedPCA:
@@ -76,9 +78,13 @@ class IPCAWorkflow:
             Starting values for Factors from a previous fit. Column count must
             match the current training window's number of time periods.
         """
+        if alpha < 0:
+            raise ValueError(f"alpha must be >= 0, got {alpha}")
+
         print(
             f"Fitting IPCA with {n_factors} factors, intercept={intercept}, "
-            f"max_iter={max_iter}, iter_tol={iter_tol}, silent={silent}, "
+            f"max_iter={max_iter}, iter_tol={iter_tol}, alpha={alpha}, silent={silent}, "
+            f"ridge_solver={ridge_solver}, "
             f"warm_Gamma={warm_Gamma is not None}, warm_Factors={warm_Factors is not None}"
         )
         model = InstrumentedPCA(
@@ -86,10 +92,10 @@ class IPCAWorkflow:
             intercept=intercept,
             max_iter=max_iter,
             iter_tol=iter_tol,
-            alpha=0.001,  # default regularization to improve convergence in small samples
+            alpha=float(alpha),
             l1_ratio=0,
         )
-        fit_kwargs: dict = dict(X=X, y=y, indices=indices)
+        fit_kwargs: dict = dict(X=X, y=y, indices=indices, ridge_solver=ridge_solver)
         if warm_Gamma is not None:
             fit_kwargs["Gamma"] = warm_Gamma
         if warm_Factors is not None:
@@ -196,7 +202,9 @@ class IPCAWorkflow:
         intercept: bool = False,
         max_iter: int = 5000,
         iter_tol: float = 1e-4,
+        alpha: float = 1.0,
         silent: bool = True,
+        ridge_solver: str = "auto",
         normalize: bool = True,
         train_window_months: Optional[int] = None,
         min_train_obs: int = 5000,
@@ -241,6 +249,11 @@ class IPCAWorkflow:
         rff_omega : np.ndarray, optional
             User-supplied omega matrix of shape
             ``(len(char_cols), rff_n_components)``. If provided, sampling is skipped.
+        ridge_solver : str
+            Ridge solver passed through to IPCA's Gamma step when ``alpha > 0``.
+            Typical values are ``"auto"``, ``"cholesky"``, and ``"lsqr"``.
+        alpha : float
+            Regularization strength for the IPCA Gamma ridge step. Must be >= 0.
         """
         _empty_pred_cols = [self.id_col, self.time_col, "y_true", "y_pred", "train_end", "n_train", "n_test"]
         if use_rff:
@@ -280,9 +293,37 @@ class IPCAWorkflow:
 
         months = np.sort(work[self.time_col].dropna().unique())
         start_ts = pd.Timestamp(forecast_start).to_period("M").to_timestamp()
-        pred_months = [m for m in months if m >= start_ts]
-        if not pred_months:
+        start_np = start_ts.to_datetime64()
+        pred_positions = np.flatnonzero(months >= start_np)
+        if pred_positions.size == 0:
             return pd.DataFrame(columns=_empty_pred_cols), pd.DataFrame(columns=_empty_diag_cols)
+
+        # Materialize core arrays once and reuse integer slices each month.
+        # This avoids repeated DataFrame filtering/copying and preserves strict
+        # no-leakage by building train/test sets from month positions only.
+        id_all = work[self.id_col].to_numpy()
+        time_all = work[self.time_col].to_numpy()
+        X_raw_all = work[char_cols].to_numpy(np.float64)
+        y_all = work[target_col].to_numpy(np.float64)
+        idx_all = work[["i_idx_global", "t_idx_global"]].to_numpy(np.int64)
+
+        # Rows are contiguous by month because work is sorted by (time, id).
+        t_codes = idx_all[:, 1]
+        change_points = np.flatnonzero(np.diff(t_codes)) + 1
+        month_starts = np.r_[0, change_points]
+        month_ends = np.r_[change_points, len(work)]
+        if month_starts.size != months.size:
+            raise RuntimeError(
+                "Month index alignment mismatch. Expected one contiguous block per month."
+            )
+
+        # For each test month, precompute start month position of the rolling train window.
+        train_start_pos = np.zeros(months.size, dtype=np.int64)
+        if train_window_months is not None:
+            months_ns = months.astype("datetime64[ns]")
+            for pos, month_val in enumerate(months):
+                cutoff = (pd.Timestamp(month_val) - pd.DateOffset(months=train_window_months)).to_datetime64()
+                train_start_pos[pos] = int(np.searchsorted(months_ns, cutoff, side="left"))
 
         # Optional fixed-per-run RFF setup.
         # We compute base normalization stats once from the first train window and
@@ -296,15 +337,13 @@ class IPCAWorkflow:
             if rff_n_components <= 0:
                 raise ValueError(f"rff_n_components must be > 0, got {rff_n_components}")
 
-            first_test_month = pred_months[0]
-            base_train = work[work[self.time_col] < first_test_month].copy()
-            if train_window_months is not None:
-                cutoff = pd.Timestamp(first_test_month) - pd.DateOffset(months=train_window_months)
-                base_train = base_train[base_train[self.time_col] >= cutoff].copy()
-            if base_train.empty:
+            first_test_pos = int(pred_positions[0])
+            base_start_pos = int(train_start_pos[first_test_pos])
+            if base_start_pos >= first_test_pos:
                 raise ValueError("Cannot initialize fixed RFF transform: no base train observations.")
 
-            X_base = base_train[char_cols].to_numpy(np.float64)
+            base_train_slice = slice(month_starts[base_start_pos], month_ends[first_test_pos - 1])
+            X_base = X_raw_all[base_train_slice]
             finite_base = np.isfinite(X_base).all(axis=1)
             if finite_base.sum() == 0:
                 raise ValueError("Cannot initialize fixed RFF transform: no finite base observations.")
@@ -332,6 +371,23 @@ class IPCAWorkflow:
                 omega = rng.standard_normal((len(char_cols), rff_n_components)) * float(rff_gamma)
             rff_proj = FixedRFFProjection(omega=omega)
 
+        # Cache month-level RFF blocks so each month is transformed at most once.
+        # Leakage safety: normalization uses only base-train stats computed above.
+        rff_cache_X: dict[int, np.ndarray] = {}
+        rff_cache_finite: dict[int, np.ndarray] = {}
+
+        def _get_rff_month_block(month_pos: int) -> tuple[np.ndarray, np.ndarray]:
+            X_block = rff_cache_X.get(month_pos)
+            finite_block = rff_cache_finite.get(month_pos)
+            if X_block is None or finite_block is None:
+                month_slice = slice(month_starts[month_pos], month_ends[month_pos])
+                X_norm = (X_raw_all[month_slice] - rff_mu) / rff_sd
+                X_block = rff_proj.transform(X_norm)
+                finite_block = np.isfinite(X_block).all(axis=1)
+                rff_cache_X[month_pos] = X_block
+                rff_cache_finite[month_pos] = finite_block
+            return X_block, finite_block
+
         results: List[pd.DataFrame] = []
         diag_rows: List[dict] = []
         prev_Gamma: Optional[np.ndarray] = None
@@ -339,50 +395,58 @@ class IPCAWorkflow:
         prev_factor_dates: Optional[np.ndarray] = None
         prev_Gamma_for_dist: Optional[np.ndarray] = None  # Gamma from t-1 for Grassmann distance
 
-        for test_month in pred_months:
-            train = work[work[self.time_col] < test_month].copy()
-            if train_window_months is not None:
-                cutoff = pd.Timestamp(test_month) - pd.DateOffset(months=train_window_months)
-                train = train[train[self.time_col] >= cutoff].copy()
-
-            test = work[work[self.time_col] == test_month].copy()
-            if train.empty or test.empty:
+        for test_pos in pred_positions:
+            test_pos = int(test_pos)
+            test_month = months[test_pos]
+            start_pos = int(train_start_pos[test_pos])
+            if start_pos >= test_pos:
                 continue
 
-            X_train_raw = train[char_cols].to_numpy(np.float64)
-            y_train_raw = train[target_col].to_numpy(np.float64)
-            idx_train = train[["i_idx_global", "t_idx_global"]].to_numpy(np.int64)
+            train_slice = slice(month_starts[start_pos], month_ends[test_pos - 1])
+            test_slice = slice(month_starts[test_pos], month_ends[test_pos])
 
-            X_test_raw = test[char_cols].to_numpy(np.float64)
-            idx_test = test[["i_idx_global", "t_idx_global"]].to_numpy(np.int64)
-            y_true = test[target_col].to_numpy(np.float64)
+            y_train_raw = y_all[train_slice]
+            idx_train_raw = idx_all[train_slice]
+            idx_test = idx_all[test_slice]
+            y_true = y_all[test_slice]
 
             if use_rff:
-                # Fixed transform for every month in this run:
-                # 1) fixed normalize (if enabled), 2) fixed omega, 3) sin/cos map.
-                X_train_norm = (X_train_raw - rff_mu) / rff_sd
-                X_test_norm = (X_test_raw - rff_mu) / rff_sd
-                X_train_feat = rff_proj.transform(X_train_norm)
-                X_test_feat = rff_proj.transform(X_test_norm)
+                # Prune stale months to keep cache bounded under rolling windows.
+                if train_window_months is not None and rff_cache_X:
+                    stale = [k for k in rff_cache_X.keys() if k < start_pos]
+                    for k in stale:
+                        rff_cache_X.pop(k, None)
+                        rff_cache_finite.pop(k, None)
 
-                finite_train = np.isfinite(X_train_feat).all(axis=1) & np.isfinite(y_train_raw)
+                train_feat_blocks: list[np.ndarray] = []
+                train_finite_blocks: list[np.ndarray] = []
+                for month_pos in range(start_pos, test_pos):
+                    X_block, finite_block = _get_rff_month_block(month_pos)
+                    train_feat_blocks.append(X_block)
+                    train_finite_blocks.append(finite_block)
+
+                X_train_feat = np.vstack(train_feat_blocks)
+                finite_feat_train = np.concatenate(train_finite_blocks)
+                finite_train = finite_feat_train & np.isfinite(y_train_raw)
                 if finite_train.sum() < min_train_obs:
                     continue
                 X_train = X_train_feat[finite_train]
                 y_train = y_train_raw[finite_train]
-                idx_train = idx_train[finite_train]
+                idx_train = idx_train_raw[finite_train]
 
-                finite_test = np.isfinite(X_test_feat).all(axis=1)
+                X_test_feat, finite_test = _get_rff_month_block(test_pos)
                 X_test = X_test_feat
             else:
+                X_train_raw = X_raw_all[train_slice]
                 finite_train = np.isfinite(X_train_raw).all(axis=1) & np.isfinite(y_train_raw)
                 if finite_train.sum() < min_train_obs:
                     continue
 
                 X_train = X_train_raw[finite_train]
                 y_train = y_train_raw[finite_train]
-                idx_train = idx_train[finite_train]
+                idx_train = idx_train_raw[finite_train]
 
+                X_test_raw = X_raw_all[test_slice]
                 finite_test = np.isfinite(X_test_raw).all(axis=1)
 
                 if normalize:
@@ -413,7 +477,8 @@ class IPCAWorkflow:
             model = self.fit_ipca(
                 X=X_train, y=y_train, indices=idx_train,
                 n_factors=n_factors, intercept=intercept,
-                max_iter=max_iter, iter_tol=iter_tol, silent=silent,
+                max_iter=max_iter, iter_tol=iter_tol, alpha=alpha, silent=silent,
+                ridge_solver=ridge_solver,
                 warm_Gamma=use_Gamma,
                 warm_Factors=use_Factors,
             )
@@ -452,17 +517,17 @@ class IPCAWorkflow:
             )
             prev_Gamma_for_dist = curr_Gamma  # distance baseline for next month
 
-            y_pred = np.full(len(test), np.nan, dtype=np.float64)
+            y_pred = np.full(y_true.shape[0], np.nan, dtype=np.float64)
             if finite_test.any():
                 y_pred[finite_test] = self._predict_ipca_panel(
                     model=model, X=X_test[finite_test],
                     indices=idx_test[finite_test], mean_factor=mean_factor,
                 )
 
-            n_rows = len(test)
+            n_rows = int(y_true.shape[0])
             row = {
-                self.id_col: test[self.id_col].to_numpy(),
-                self.time_col: test[self.time_col].to_numpy(),
+                self.id_col: id_all[test_slice],
+                self.time_col: time_all[test_slice],
                 "y_true": y_true,
                 "y_pred": y_pred,
                 "train_end": pd.Timestamp(test_month) - pd.offsets.MonthBegin(1),

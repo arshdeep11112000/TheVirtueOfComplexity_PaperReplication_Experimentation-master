@@ -1,5 +1,6 @@
 import numpy as np
 from matplotlib import pyplot as plt
+from scipy.optimize import differential_evolution
 
 import autograd.numpy as anp
 from pymanopt import Problem
@@ -98,6 +99,41 @@ from pymanopt.optimizers import ConjugateGradient, SteepestDescent, TrustRegions
 #______________________________________________________________________________________________________________
 
 
+class ConfigurableGrassmann(Grassmann):
+    """Grassmann manifold with selectable retraction backend."""
+
+    def __init__(self, n: int, p: int, *, retraction_method: str = "svd"):
+        super().__init__(n, p)
+        method = str(retraction_method).lower().replace("_", "").replace("-", "")
+        aliases = {
+            "auto": "svd",
+            "svd": "svd",
+            "polar": "svd",
+            "qr": "qr",
+            "thinqr": "qr",
+        }
+        try:
+            self._retraction_method = aliases[method]
+        except KeyError as exc:
+            raise ValueError(
+                "retraction_method must be one of: auto, svd, polar, qr, thin_qr"
+            ) from exc
+
+    def retraction(self, point, tangent_vector):
+        if self._retraction_method == "qr":
+            y = point + tangent_vector
+            q, r = np.linalg.qr(y, mode="reduced")
+
+            # Fix QR sign ambiguity so the returned representative is stable.
+            signs = np.sign(np.diagonal(r, axis1=-2, axis2=-1))
+            signs = np.where(signs == 0, 1.0, signs)
+            return q * np.expand_dims(signs, axis=-2)
+        return super().retraction(point, tangent_vector)
+
+
+#______________________________________________________________________________________________________________
+
+
 class GrassmannIPCAEstimator:
     def __init__(self, num_assets, num_fact, num_charact, win_len):
         self.num_assets = num_assets  # N
@@ -106,12 +142,18 @@ class GrassmannIPCAEstimator:
         self.dim = self.grass_n * self.grass_k
         self.win_len = win_len
 
-    def loss_fct(self, w, data):
-        w = np.asarray(w)
+    def _project_to_grassmann(self, w):
+        w = np.asarray(w, dtype=float)
         if w.ndim == 1:
             w = w.reshape(self.grass_n, self.grass_k)
-        if w.ndim == 2:
-            assert w.shape == (self.grass_n, self.grass_k)
+        if w.ndim != 2 or w.shape != (self.grass_n, self.grass_k):
+            raise ValueError(f"Expected shape {(self.grass_n, self.grass_k)}, got {w.shape}")
+
+        q, _ = np.linalg.qr(w, mode="reduced")
+        return q[:, :self.grass_k]
+
+    def loss_fct(self, w, data):
+        w = self._project_to_grassmann(w)
 
         rets, Z = data
         assert rets.shape == (self.win_len, self.num_assets)
@@ -129,26 +171,33 @@ class GrassmannIPCAEstimator:
         return obj / self.win_len
 
     def fit(self, data, max_gen=500):
-        w_min = np.full(self.dim, -1.0)
-        w_max = np.ones(self.dim)
-        pop_size = 5 * self.dim
+        bounds = [(-1.0, 1.0)] * self.dim
+        history = []
 
-        de = JDifferentialEvolution(
-            w_min, w_max, pop_size,
-            model='grassmannian',
-            grass_k=self.grass_k
+        def objective(flat_w):
+            return self.loss_fct(flat_w, data=data)
+
+        def callback(xk, convergence):
+            history.append(objective(xk))
+            return False
+
+        result = differential_evolution(
+            objective,
+            bounds=bounds,
+            maxiter=max_gen,
+            popsize=5,
+            callback=callback,
+            disp=True,
+            polish=True,
         )
 
-        w_opt, max_dist, max_gen, history = de.optimize(
-            self.loss_fct, params=data,
-            eps=1e-3, max_gen=max_gen,
-            history=True, verbose=True
-        )
-
-        W = np.asarray(w_opt).reshape(self.grass_n, self.grass_k)
+        W = self._project_to_grassmann(result.x)
+        history.append(float(result.fun))
         print(f"W:\n{W}")
-        print(f"max_dist: {max_dist}")
-        print(f"max_gen: {max_gen}")
+        print(f"success: {result.success}")
+        print(f"message: {result.message}")
+        print(f"nfev: {result.nfev}")
+        print(f"nit: {result.nit}")
         print(f"objective function: {self.loss_fct(W, data=data)}")
 
         plt.figure(figsize=(8, 5))
@@ -204,7 +253,7 @@ class GrassmannManifoldIPCAEstimator:
         LtL     = Lt @ L                                  # (T, k, k)
         LtL_reg = LtL + z * np.eye(k)                    # (T, k, k)
         Ltr     = (Lt @ rets[..., None]).squeeze(-1)      # (T, k)
-        f_hat   = np.linalg.solve(LtL_reg, Ltr)          # (T, k)
+        f_hat   = np.linalg.solve(LtL_reg, Ltr[..., None]).squeeze(-1)  # (T, k)
         return f_hat
 
     # ------------------------------------------------------------------
@@ -215,10 +264,13 @@ class GrassmannManifoldIPCAEstimator:
         data,
         optimizer: str = "ConjugateGradient",
         max_iterations: int = 200,
+        iter_tol: float = 1e-6,
         verbosity: int = 1,
-        log_verbosity: int = 1,
+        log_verbosity: int = 0,
         initial_point: np.ndarray | None = None,
         reuse_line_searcher: bool = False,
+        cg_beta_rule: str = "PolakRibiere",
+        retraction_method: str = "svd",
         return_pymanopt_result: bool = False,
     ):
         """
@@ -235,6 +287,9 @@ class GrassmannManifoldIPCAEstimator:
           history: list of costs (best effort; from result.log if available)
           (optionally) result
         """
+        if iter_tol <= 0:
+            raise ValueError(f"iter_tol must be > 0, got {iter_tol}")
+
         rets, Z = data
         assert rets.shape == (self.win_len, self.num_assets)
         assert Z.shape == (self.win_len, self.num_assets, self.grass_n)
@@ -261,7 +316,11 @@ class GrassmannManifoldIPCAEstimator:
                 obj = obj + anp.dot(resid, resid)
             return obj / T_
 
-        manifold = Grassmann(self.grass_n, self.grass_k)
+        manifold = ConfigurableGrassmann(
+            self.grass_n,
+            self.grass_k,
+            retraction_method=retraction_method,
+        )
         rets_ag = anp.asarray(rets)
         Z_ag = anp.asarray(Z)
 
@@ -274,7 +333,9 @@ class GrassmannManifoldIPCAEstimator:
         opt = optimizer.lower().replace("_", "")
         if opt in {"cg", "conjugategradient"}:
             solver = ConjugateGradient(
+                beta_rule=cg_beta_rule,
                 max_iterations=max_iterations,
+                min_gradient_norm=float(iter_tol),
                 verbosity=verbosity,
                 log_verbosity=log_verbosity,
             )
@@ -282,6 +343,7 @@ class GrassmannManifoldIPCAEstimator:
         elif opt in {"sd", "steepestdescent"}:
             solver = SteepestDescent(
                 max_iterations=max_iterations,
+                min_gradient_norm=float(iter_tol),
                 verbosity=verbosity,
                 log_verbosity=log_verbosity,
             )
@@ -289,6 +351,7 @@ class GrassmannManifoldIPCAEstimator:
         elif opt in {"tr", "trustregions"}:
             solver = TrustRegions(
                 max_iterations=max_iterations,
+                min_gradient_norm=float(iter_tol),
                 verbosity=verbosity,
                 log_verbosity=log_verbosity,
             )

@@ -23,6 +23,7 @@ from src.dataset import load_data, load_nber
 from src.ipca_workflow import IPCAWorkflow
 from src.openap_subset import dl_openap_subset
 from src.portfolio_utils import (
+    build_directional_portfolio,
     build_long_only_portfolio,
     build_quantile_portfolios,
     compute_portfolio_returns,
@@ -48,6 +49,7 @@ __all__ = [
     "IPCAMatrices",
     "build_quantile_portfolios",
     "build_long_only_portfolio",
+    "build_directional_portfolio",
     "compute_portfolio_returns",
     "portfolio_performance",
     "plot_cumulative",

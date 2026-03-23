@@ -108,7 +108,9 @@ class DataPipeline:
                     msf.ret,
                     dl.dlret,
                     msf.prc,
-                    msf.shrout
+                    msf.shrout,
+                    msf.cfacpr,
+                    msf.cfacshr
                 FROM crsp.msf AS msf
                 INNER JOIN crsp.msp500list AS sp
                     ON  msf.permno = sp.permno
@@ -127,7 +129,9 @@ class DataPipeline:
                     msf.date,
                     msf.ret,
                     msf.prc,
-                    msf.shrout
+                    msf.shrout,
+                    msf.cfacpr,
+                    msf.cfacshr
                 FROM crsp.msf AS msf
                 INNER JOIN crsp.msp500list AS sp
                     ON  msf.permno = sp.permno
@@ -144,6 +148,9 @@ class DataPipeline:
 
         out = out.copy()
         out["ret"] = pd.to_numeric(out["ret"], errors="coerce")
+        for col in ["prc", "shrout", "cfacpr", "cfacshr"]:
+            if col in out.columns:
+                out[col] = pd.to_numeric(out[col], errors="coerce")
         if "dlret" in out.columns:
             out["dlret"] = pd.to_numeric(out["dlret"], errors="coerce")
             out["ret_adj"] = (1.0 + out["ret"].fillna(0.0)) * (
@@ -170,7 +177,19 @@ class DataPipeline:
             raise ValueError("max_nan_frac must be between 0 and 1.")
 
         if protected_cols is None:
-            protected_cols = [self.id_col, self.time_col, "ret", "excess_ret", "year"]
+            protected_cols = [
+                self.id_col,
+                self.time_col,
+                "ret",
+                "ret_adj",
+                "excess_ret",
+                "year",
+                "prc",
+                "shrout",
+                "cfacpr",
+                "cfacshr",
+                "mcap",
+            ]
 
         protected_set = set(protected_cols)
         nan_fracs = df.isna().mean()
@@ -189,6 +208,7 @@ class DataPipeline:
         output_return_col: Optional[str] = None,
         how: str = "inner",
         keep_crsp_columns: Optional[List[str]] = None,
+        add_market_cap: bool = True,
     ) -> pd.DataFrame:
         """Merge OpenAP characteristics with CRSP returns on entity-month.
 
@@ -205,7 +225,12 @@ class DataPipeline:
         how : str
             Merge mode, typically ``inner`` or ``left``.
         keep_crsp_columns : list[str], optional
-            Extra CRSP columns to keep in output (e.g., ``["prc", "shrout"]``).
+            Extra CRSP columns to keep in output. If omitted, standard CRSP
+            price/share fields are retained when available:
+            ``["prc", "shrout", "cfacpr", "cfacshr"]``.
+        add_market_cap : bool
+            If True and ``prc``/``shrout`` are present, add raw CRSP market cap
+            as ``mcap = abs(prc) * shrout``.
         """
         if output_return_col is None:
             output_return_col = self.ret_col
@@ -238,16 +263,29 @@ class DataPipeline:
             raise ValueError(f"CRSP data must include '{self.time_col}' or 'date' column.")
 
         crsp_keep = [self.id_col, self.time_col, crsp_return_col]
-        if keep_crsp_columns:
-            for col in keep_crsp_columns:
-                if col in right.columns and col not in crsp_keep:
-                    crsp_keep.append(col)
+        if keep_crsp_columns is None:
+            keep_crsp_columns = ["prc", "shrout", "cfacpr", "cfacshr"]
+        for col in keep_crsp_columns:
+            if col in right.columns and col not in crsp_keep:
+                crsp_keep.append(col)
+
+        replace_cols = [output_return_col] + [c for c in keep_crsp_columns if c in left.columns]
+        if add_market_cap and "mcap" in left.columns:
+            replace_cols.append("mcap")
+        replace_cols = [c for c in replace_cols if c in left.columns]
+        if replace_cols:
+            left = left.drop(columns=replace_cols)
 
         right = right[crsp_keep].rename(columns={crsp_return_col: output_return_col})
         merged = left.merge(right, on=[self.id_col, self.time_col], how=how, validate="m:1")
 
         if output_return_col in merged.columns:
             merged[output_return_col] = pd.to_numeric(merged[output_return_col], errors="coerce")
+        for col in ["prc", "shrout", "cfacpr", "cfacshr"]:
+            if col in merged.columns:
+                merged[col] = pd.to_numeric(merged[col], errors="coerce")
+        if add_market_cap and {"prc", "shrout"}.issubset(merged.columns):
+            merged["mcap"] = merged["prc"].abs() * merged["shrout"]
 
         return merged.sort_values([self.id_col, self.time_col]).reset_index(drop=True)
 
@@ -255,22 +293,77 @@ class DataPipeline:
         self,
         df: pd.DataFrame,
         protected_cols: Optional[List[str]] = None,
+        use_past_only: bool = False,
     ) -> pd.DataFrame:
-        """Fill remaining missing numeric values by month median then global median."""
+        """Fill remaining numeric NaNs by same-month median, then fallback median.
+
+        If ``use_past_only`` is False (default), the fallback is the full-sample
+        global median for each column.
+
+        If ``use_past_only`` is True, the fallback is a time-safe historical
+        median built only from strictly earlier months.
+        """
         if protected_cols is None:
-            protected_cols = [self.id_col, self.time_col, "ret", "excess_ret", "year"]
+            protected_cols = [
+                self.id_col,
+                self.time_col,
+                "ret",
+                "ret_adj",
+                "excess_ret",
+                "year",
+                "prc",
+                "shrout",
+                "cfacpr",
+                "cfacshr",
+                "mcap",
+            ]
 
         out = df.copy()
         num_cols = [
             c for c in out.columns if c not in protected_cols and pd.api.types.is_numeric_dtype(out[c])
         ]
+        if not num_cols:
+            return out
 
-        global_medians = out[num_cols].median()
+        if not use_past_only:
+            global_medians = out[num_cols].median()
+            out[num_cols] = out.groupby(self.time_col)[num_cols].transform(
+                lambda s: s.fillna(s.median())
+            )
+            out[num_cols] = out[num_cols].fillna(global_medians)
+            return out
+
+        # Time-safe mode:
+        # 1) fill by same-month cross-sectional median
+        # 2) remaining NaNs use median from strictly earlier months only
+        out[self.time_col] = pd.to_datetime(out[self.time_col], errors="coerce").dt.to_period(
+            "M"
+        ).dt.to_timestamp()
+        original_index = out.index
+        sort_cols = [self.time_col]
+        if self.id_col in out.columns:
+            sort_cols.append(self.id_col)
+        out = out.sort_values(sort_cols).copy()
+
         out[num_cols] = out.groupby(self.time_col)[num_cols].transform(
             lambda s: s.fillna(s.median())
         )
-        out[num_cols] = out[num_cols].fillna(global_medians)
-        return out
+
+        monthly_medians = (
+            out.groupby(self.time_col, sort=True)[num_cols]
+            .median()
+            .sort_index()
+        )
+        historical_medians = monthly_medians.expanding(min_periods=1).median().shift(1)
+
+        hist_lookup = historical_medians.add_suffix("__hist")
+        out = out.join(hist_lookup, on=self.time_col)
+        for col in num_cols:
+            hist_col = f"{col}__hist"
+            out[col] = out[col].fillna(out[hist_col])
+        out = out.drop(columns=list(hist_lookup.columns))
+
+        return out.loc[original_index]
 
     def drop_low_std_and_high_corr(
         self,
@@ -302,7 +395,8 @@ class DataPipeline:
         if protected_cols is None:
             protected_cols = [
                 self.id_col, self.time_col,
-                "ret", "excess_ret", "year", "y_ipca", "i_idx", "t_idx",
+                "ret", "ret_adj", "excess_ret", "year", "y_ipca", "i_idx", "t_idx",
+                "prc", "shrout", "cfacpr", "cfacshr", "mcap",
             ]
 
         if char_cols is None:
@@ -386,7 +480,20 @@ class DataPipeline:
         else:
             out[target_col] = out[self.ret_col]
 
-        exclude = {self.id_col, self.time_col, "ret", "excess_ret", "year", target_col}
+        exclude = {
+            self.id_col,
+            self.time_col,
+            "ret",
+            "ret_adj",
+            "excess_ret",
+            "year",
+            target_col,
+            "prc",
+            "shrout",
+            "cfacpr",
+            "cfacshr",
+            "mcap",
+        }
         if extra_exclude:
             exclude.update(extra_exclude)
         char_cols = [

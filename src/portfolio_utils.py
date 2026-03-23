@@ -132,8 +132,102 @@ def build_long_only_portfolio(
     return port
 
 
+def build_directional_portfolio(
+    pred_df: pd.DataFrame,
+    date_col: str = "yyyymm",
+    pred_col: str = "y_pred",
+    ret_col: str = "y_true",
+    weighting: str = "prediction_scaled",
+    normalize_weights: bool = True,
+    gross_exposure: float = 1.0,
+    drop_zero_preds: bool = True,
+) -> pd.DataFrame:
+    """Build a simple long-short portfolio from predicted returns.
+
+    Parameters
+    ----------
+    pred_df : pd.DataFrame
+        Input panel containing date, prediction, and realized return columns.
+    date_col : str
+        Monthly date column.
+    pred_col : str
+        Predicted return / signal column.
+    ret_col : str
+        Realized return column.
+    weighting : {"prediction_scaled", "equal_weight_sign"}
+        ``prediction_scaled`` uses predicted returns as weights. Positive
+        predictions are long, negative predictions are short.
+        ``equal_weight_sign`` ignores magnitude and gives each non-zero signal
+        the same absolute weight.
+    normalize_weights : bool
+        When ``True`` and ``weighting='prediction_scaled'``, scale each month's
+        weights so the sum of absolute weights equals ``gross_exposure``.
+        When ``False``, asset weights are ``gross_exposure * y_pred``.
+    gross_exposure : float
+        Target gross exposure when normalized. Must be positive.
+    drop_zero_preds : bool
+        If ``True``, rows with zero predictions are excluded from the portfolio.
+
+    Returns
+    -------
+    pd.DataFrame
+        Asset-level portfolio with weights and return contributions. The
+        ``raw_signal_return_pct`` column matches the user's requested
+        ``y_pred * y_true * 100`` style metric, while ``contribution_pct`` is
+        based on the portfolio weight actually used.
+    """
+    required = {date_col, pred_col, ret_col}
+    missing = [c for c in required if c not in pred_df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+    if weighting not in {"prediction_scaled", "equal_weight_sign"}:
+        raise ValueError(
+            "weighting must be either 'prediction_scaled' or 'equal_weight_sign'."
+        )
+    if gross_exposure <= 0:
+        raise ValueError("gross_exposure must be positive.")
+
+    port = pred_df.copy()
+    port[date_col] = pd.to_datetime(port[date_col], errors="coerce").dt.to_period("M").dt.to_timestamp()
+    port[pred_col] = pd.to_numeric(port[pred_col], errors="coerce")
+    port[ret_col] = pd.to_numeric(port[ret_col], errors="coerce")
+    port = port.dropna(subset=[date_col, pred_col, ret_col]).copy()
+    if port.empty:
+        raise ValueError("No valid rows left after coercion/dropna.")
+
+    port["position"] = np.sign(port[pred_col]).astype(float)
+    if drop_zero_preds:
+        port = port[port["position"] != 0].copy()
+    if port.empty:
+        raise ValueError("No non-zero predictions available for portfolio construction.")
+
+    # Raw signal-return interaction, useful when you want y_pred * y_true * 100.
+    port["raw_signal_return"] = port[pred_col] * port[ret_col]
+    port["raw_signal_return_pct"] = 100.0 * port["raw_signal_return"]
+
+    if weighting == "equal_weight_sign":
+        n_active = port.groupby(date_col)["position"].transform("size")
+        port["weight"] = gross_exposure * port["position"] / n_active
+    else:
+        if normalize_weights:
+            port["gross_signal"] = port.groupby(date_col)[pred_col].transform(
+                lambda s: np.abs(s).sum()
+            )
+            port = port[port["gross_signal"] > 0].copy()
+            if port.empty:
+                raise ValueError("All months have zero gross predicted signal.")
+            port["weight"] = gross_exposure * port[pred_col] / port["gross_signal"]
+        else:
+            port["weight"] = gross_exposure * port[pred_col]
+
+    port["contribution"] = port["weight"] * port[ret_col]
+    port["contribution_pct"] = 100.0 * port["contribution"]
+
+    return port.sort_values([date_col, pred_col], ascending=[True, False]).reset_index(drop=True)
+
+
 def compute_portfolio_returns(port: pd.DataFrame) -> pd.DataFrame:
-    """Weighted average realized return each month."""
+    """Aggregate monthly portfolio returns from asset-level weights."""
     required = {"yyyymm", "weight", "y_true"}
     missing = [c for c in required if c not in port.columns]
     if missing:

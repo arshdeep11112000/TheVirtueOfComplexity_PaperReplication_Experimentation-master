@@ -276,6 +276,7 @@ class IPCAWorkflow:
         silent: bool = True,
         ridge_solver: str = "auto",
         normalize: bool = True,
+        rolling_normalization: bool = False,
         train_window_months: Optional[int] = None,
         min_train_obs: int = 5000,
         mean_factor: bool = True,
@@ -285,6 +286,7 @@ class IPCAWorkflow:
         rff_gamma: float = DEFAULT_RFF_GAMMA,
         rff_random_state: Optional[int] = 42,
         rff_omega: Optional[np.ndarray] = None,
+        rff_rolling_normalization: Optional[bool] = None,
         market_cap_filter_col: Optional[str] = None,
         market_cap_filter_top_n: Optional[int] = None,
         market_cap_filter_top_share: Optional[float] = None,
@@ -327,6 +329,18 @@ class IPCAWorkflow:
         ridge_solver : str
             Ridge solver passed through to IPCA's Gamma step when ``alpha > 0``.
             Typical values are ``"auto"``, ``"cholesky"``, and ``"lsqr"``.
+        rolling_normalization : bool
+            If True, recompute train-only normalization statistics at each
+            rolling step. If False (default), freeze the normalization
+            statistics from the first train window for non-RFF runs. RFF runs
+            inherit this setting unless ``rff_rolling_normalization`` is set.
+        rff_rolling_normalization : bool, optional
+            Optional override for the RFF branch. If True, recompute train-only
+            normalization statistics for the RFF branch at each rolling step
+            while keeping the sampled ``omega`` fixed. If False, freeze the RFF
+            normalization statistics from the first train window so the full
+            raw-to-RFF map stays fixed across time. If omitted, the RFF branch
+            follows ``rolling_normalization``.
         alpha : float
             Regularization strength for the IPCA Gamma ridge step. Must be >= 0.
         market_cap_filter_col : str, optional
@@ -455,22 +469,23 @@ class IPCAWorkflow:
                 cutoff = (pd.Timestamp(month_val) - pd.DateOffset(months=train_window_months)).to_datetime64()
                 train_start_pos[pos] = int(np.searchsorted(months_ns, cutoff, side="left"))
 
-        # Optional fixed-per-run RFF setup.
-        # We compute base normalization stats once from the first train window and
-        # reuse both (mu, sd) and omega for all rolling months.
-        rff_proj: Optional[FixedRFFProjection] = None
-        rff_mu: Optional[np.ndarray] = None
-        rff_sd: Optional[np.ndarray] = None
-        if use_rff:
-            if rff_gamma <= 0:
-                raise ValueError(f"rff_gamma must be > 0, got {rff_gamma}")
-            if rff_n_components <= 0:
-                raise ValueError(f"rff_n_components must be > 0, got {rff_n_components}")
+        effective_rff_rolling_normalization = (
+            rolling_normalization
+            if rff_rolling_normalization is None
+            else bool(rff_rolling_normalization)
+        )
+
+        fixed_norm_stats: Optional[tuple[np.ndarray, np.ndarray]] = None
+
+        def _get_fixed_normalization_stats() -> tuple[np.ndarray, np.ndarray]:
+            nonlocal fixed_norm_stats
+            if fixed_norm_stats is not None:
+                return fixed_norm_stats
 
             first_test_pos = int(pred_positions[0])
             base_start_pos = int(train_start_pos[first_test_pos])
             if base_start_pos >= first_test_pos:
-                raise ValueError("Cannot initialize fixed RFF transform: no base train observations.")
+                raise ValueError("Cannot initialize fixed normalization: no base train observations.")
 
             base_train_slice = slice(month_starts[base_start_pos], month_ends[first_test_pos - 1])
             X_base = X_raw_all[base_train_slice]
@@ -479,16 +494,26 @@ class IPCAWorkflow:
                 base_selected_ids = prev_month_market_cap_universe[first_test_pos]
                 finite_base = finite_base & np.isin(id_all[base_train_slice], base_selected_ids)
             if finite_base.sum() == 0:
-                raise ValueError("Cannot initialize fixed RFF transform: no finite base observations.")
-            X_base = X_base[finite_base]
+                raise ValueError("Cannot initialize fixed normalization: no finite base observations.")
 
-            if normalize:
-                rff_mu = X_base.mean(axis=0)
-                rff_sd = X_base.std(axis=0, ddof=0)
-                rff_sd = np.where(np.isfinite(rff_sd) & (rff_sd > 0), rff_sd, 1.0)
-            else:
-                rff_mu = np.zeros(X_base.shape[1], dtype=np.float64)
-                rff_sd = np.ones(X_base.shape[1], dtype=np.float64)
+            X_base = X_base[finite_base]
+            mu = X_base.mean(axis=0)
+            sd = X_base.std(axis=0, ddof=0)
+            sd = np.where(np.isfinite(sd) & (sd > 0), sd, 1.0)
+            fixed_norm_stats = (mu, sd)
+            return fixed_norm_stats
+
+        # Optional fixed-per-run RFF setup.
+        # Omega is always fixed within one call. Normalization can either be
+        # fixed from the first train window or recomputed each rolling step.
+        rff_proj: Optional[FixedRFFProjection] = None
+        rff_mu: Optional[np.ndarray] = None
+        rff_sd: Optional[np.ndarray] = None
+        if use_rff:
+            if rff_gamma <= 0:
+                raise ValueError(f"rff_gamma must be > 0, got {rff_gamma}")
+            if rff_n_components <= 0:
+                raise ValueError(f"rff_n_components must be > 0, got {rff_n_components}")
 
             if rff_omega is not None:
                 omega = np.asarray(rff_omega, dtype=np.float64)
@@ -504,12 +529,19 @@ class IPCAWorkflow:
                 omega = rng.standard_normal((len(char_cols), rff_n_components)) * float(rff_gamma)
             rff_proj = FixedRFFProjection(omega=omega)
 
-        # Cache month-level RFF blocks so each month is transformed at most once.
-        # Leakage safety: normalization uses only base-train stats computed above.
+            if not effective_rff_rolling_normalization:
+                if normalize:
+                    rff_mu, rff_sd = _get_fixed_normalization_stats()
+                else:
+                    rff_mu = np.zeros(len(char_cols), dtype=np.float64)
+                    rff_sd = np.ones(len(char_cols), dtype=np.float64)
+
+        # Cache month-level RFF blocks only when normalization is fixed across
+        # the entire run; rolling normalization changes the feature map each month.
         rff_cache_X: dict[int, np.ndarray] = {}
         rff_cache_finite: dict[int, np.ndarray] = {}
 
-        def _get_rff_month_block(month_pos: int) -> tuple[np.ndarray, np.ndarray]:
+        def _get_fixed_rff_month_block(month_pos: int) -> tuple[np.ndarray, np.ndarray]:
             X_block = rff_cache_X.get(month_pos)
             finite_block = rff_cache_finite.get(month_pos)
             if X_block is None or finite_block is None:
@@ -581,32 +613,65 @@ class IPCAWorkflow:
                     y_true = y_true_raw[test_universe_mask]
 
                     if use_rff:
-                        # Prune stale months to keep cache bounded under rolling windows.
-                        if train_window_months is not None and rff_cache_X:
-                            stale = [k for k in rff_cache_X.keys() if k < start_pos]
-                            for k in stale:
-                                rff_cache_X.pop(k, None)
-                                rff_cache_finite.pop(k, None)
+                        if effective_rff_rolling_normalization:
+                            X_train_raw = X_raw_all[train_slice]
+                            finite_train = (
+                                train_universe_mask
+                                & np.isfinite(X_train_raw).all(axis=1)
+                                & np.isfinite(y_train_raw)
+                            )
+                            if finite_train.sum() < min_train_obs:
+                                continue
 
-                        train_feat_blocks: list[np.ndarray] = []
-                        train_finite_blocks: list[np.ndarray] = []
-                        for month_pos in range(start_pos, test_pos):
-                            X_block, finite_block = _get_rff_month_block(month_pos)
-                            train_feat_blocks.append(X_block)
-                            train_finite_blocks.append(finite_block)
+                            X_train_raw = X_train_raw[finite_train]
+                            y_train = y_train_raw[finite_train]
+                            idx_train = idx_train_raw[finite_train]
 
-                        X_train_feat = np.vstack(train_feat_blocks)
-                        finite_feat_train = np.concatenate(train_finite_blocks)
-                        finite_train = train_universe_mask & finite_feat_train & np.isfinite(y_train_raw)
-                        if finite_train.sum() < min_train_obs:
-                            continue
-                        X_train = X_train_feat[finite_train]
-                        y_train = y_train_raw[finite_train]
-                        idx_train = idx_train_raw[finite_train]
+                            if normalize:
+                                rff_mu_curr = X_train_raw.mean(axis=0)
+                                rff_sd_curr = X_train_raw.std(axis=0, ddof=0)
+                                rff_sd_curr = np.where(
+                                    np.isfinite(rff_sd_curr) & (rff_sd_curr > 0), rff_sd_curr, 1.0
+                                )
+                                X_train_norm = (X_train_raw - rff_mu_curr) / rff_sd_curr
+                            else:
+                                rff_mu_curr = np.zeros(X_train_raw.shape[1], dtype=np.float64)
+                                rff_sd_curr = np.ones(X_train_raw.shape[1], dtype=np.float64)
+                                X_train_norm = X_train_raw
 
-                        X_test_feat_raw, finite_test_raw = _get_rff_month_block(test_pos)
-                        X_test = X_test_feat_raw[test_universe_mask]
-                        finite_test = finite_test_raw[test_universe_mask]
+                            X_train = rff_proj.transform(X_train_norm)
+
+                            X_test_raw = X_raw_all[test_slice][test_universe_mask]
+                            X_test_norm = (X_test_raw - rff_mu_curr) / rff_sd_curr
+                            X_test = rff_proj.transform(X_test_norm)
+                            finite_test = np.isfinite(X_test).all(axis=1)
+                        else:
+                            # Prune stale months to keep cache bounded under rolling windows.
+                            if train_window_months is not None and rff_cache_X:
+                                stale = [k for k in rff_cache_X.keys() if k < start_pos]
+                                for k in stale:
+                                    rff_cache_X.pop(k, None)
+                                    rff_cache_finite.pop(k, None)
+
+                            train_feat_blocks: list[np.ndarray] = []
+                            train_finite_blocks: list[np.ndarray] = []
+                            for month_pos in range(start_pos, test_pos):
+                                X_block, finite_block = _get_fixed_rff_month_block(month_pos)
+                                train_feat_blocks.append(X_block)
+                                train_finite_blocks.append(finite_block)
+
+                            X_train_feat = np.vstack(train_feat_blocks)
+                            finite_feat_train = np.concatenate(train_finite_blocks)
+                            finite_train = train_universe_mask & finite_feat_train & np.isfinite(y_train_raw)
+                            if finite_train.sum() < min_train_obs:
+                                continue
+                            X_train = X_train_feat[finite_train]
+                            y_train = y_train_raw[finite_train]
+                            idx_train = idx_train_raw[finite_train]
+
+                            X_test_feat_raw, finite_test_raw = _get_fixed_rff_month_block(test_pos)
+                            X_test = X_test_feat_raw[test_universe_mask]
+                            finite_test = finite_test_raw[test_universe_mask]
                     else:
                         X_train_raw = X_raw_all[train_slice]
                         finite_train = (
@@ -625,9 +690,12 @@ class IPCAWorkflow:
                         finite_test = np.isfinite(X_test_raw).all(axis=1)
 
                         if normalize:
-                            mu = X_train.mean(axis=0)
-                            sd = X_train.std(axis=0, ddof=0)
-                            sd = np.where(np.isfinite(sd) & (sd > 0), sd, 1.0)
+                            if rolling_normalization:
+                                mu = X_train.mean(axis=0)
+                                sd = X_train.std(axis=0, ddof=0)
+                                sd = np.where(np.isfinite(sd) & (sd > 0), sd, 1.0)
+                            else:
+                                mu, sd = _get_fixed_normalization_stats()
                             X_train = (X_train - mu) / sd
                             X_test = (X_test_raw - mu) / sd
                         else:

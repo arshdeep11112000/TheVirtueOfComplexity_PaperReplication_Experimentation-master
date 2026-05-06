@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 from matplotlib import pyplot as plt
 from scipy.optimize import differential_evolution
 
@@ -563,6 +564,111 @@ def generate_ipca_data(
         },
     }
     return data, truth
+
+
+def generate_ipca_workflow_panel(
+        T: int = 252,
+        N: int = 500,
+        m: int = 20,
+        k: int = 5,
+        seed: int = 124,
+        start_date: str = "1990-01-01",
+        permno_start: int = 10_000,
+        feature_prefix: str = "char",
+        include_intercept: bool = False,
+        mcap_loc: float = 10.0,
+        mcap_rho: float = 0.98,
+        mcap_noise: float = 0.15,
+        mcap_return_loading: float = 0.25,
+        **generator_kwargs,
+):
+    """
+    Generate a long-form synthetic panel compatible with GrassmannIPCAWorkflow.
+
+    The returned DataFrame matches the notebook workflow's expectations:
+      - one row per (permno, month)
+      - characteristic columns named like ``char_000``
+      - ``excess_ret`` / ``ret_adj`` as the realized return at month t
+      - ``y_ipca`` as the next-month target return for each asset
+      - ``mcap`` as a positive, persistent market-cap proxy for stock filtering
+
+    Parameters other than the panel-specific ones are passed through to
+    ``generate_ipca_data()`` so you can control the synthetic IPCA DGP.
+
+    Returns
+    -------
+    panel_df : pd.DataFrame
+        Workflow-ready characteristic panel.
+    truth : dict
+        The truth dictionary from ``generate_ipca_data()`` augmented with
+        ``permnos``, ``dates``, and ``char_cols``.
+    """
+
+    data, truth = generate_ipca_data(
+        T=T,
+        N=N,
+        m=m,
+        k=k,
+        seed=seed,
+        include_intercept=include_intercept,
+        **generator_kwargs,
+    )
+    rets, Z = data
+
+    if rets.shape != (T, N):
+        raise ValueError(f"Expected rets shape {(T, N)}, got {rets.shape}")
+    if Z.shape[:2] != (T, N):
+        raise ValueError(f"Expected Z leading shape {(T, N)}, got {Z.shape[:2]}")
+
+    start_ts = pd.Timestamp(start_date).to_period("M").to_timestamp()
+    dates = pd.date_range(start=start_ts, periods=T, freq="MS")
+    permnos = np.arange(permno_start, permno_start + N, dtype=np.int64)
+
+    if include_intercept:
+        char_cols = [f"{feature_prefix}_intercept"] + [
+            f"{feature_prefix}_{j:03d}" for j in range(1, Z.shape[2])
+        ]
+    else:
+        char_cols = [f"{feature_prefix}_{j:03d}" for j in range(Z.shape[2])]
+
+    rng = np.random.default_rng(seed + 1)
+    log_mcap = np.empty((T, N), dtype=float)
+    log_mcap[0] = rng.normal(loc=mcap_loc, scale=1.0, size=N)
+    for t in range(1, T):
+        innovation = rng.normal(scale=mcap_noise, size=N)
+        log_mcap[t] = (
+            mcap_rho * log_mcap[t - 1]
+            + (1.0 - mcap_rho) * mcap_loc
+            + mcap_return_loading * rets[t - 1]
+            + innovation
+        )
+    mcap = np.exp(np.clip(log_mcap, -10.0, 20.0))
+
+    panel_df = pd.DataFrame(
+        {
+            "yyyymm": np.repeat(dates.to_numpy(), N),
+            "permno": np.tile(permnos, T),
+            "excess_ret": rets.reshape(-1),
+            "ret_adj": rets.reshape(-1),
+            "mcap": mcap.reshape(-1),
+        }
+    )
+
+    for j, col in enumerate(char_cols):
+        panel_df[col] = Z[:, :, j].reshape(-1)
+
+    panel_df = panel_df.sort_values(["permno", "yyyymm"]).reset_index(drop=True)
+    panel_df["y_ipca"] = panel_df.groupby("permno")["excess_ret"].shift(-1)
+    panel_df = panel_df.dropna(subset=["y_ipca"]).sort_values(
+        ["yyyymm", "permno"]
+    ).reset_index(drop=True)
+
+    truth = dict(truth)
+    truth["permnos"] = permnos
+    truth["dates"] = dates
+    truth["char_cols"] = char_cols
+
+    return panel_df, truth
 
 
 #______________________________________________________________________________________________________________
